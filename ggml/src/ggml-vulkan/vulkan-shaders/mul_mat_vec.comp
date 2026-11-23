@@ -74,6 +74,18 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             ibi += p.ncols;
 
 #if K_PER_ITER == 8
+#if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)
+            const uint sub    = iqs >> 4;
+            const uint shift  = (iqs & 8u) >> 1;
+            const float d     = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]) * 0.5f;
+            const uint vui0   = (data_a_packed32[a_offset + ib].qs[sub * 2u + 0u] >> shift) & 0x0F0F0F0Fu;
+            const uint vui1   = (data_a_packed32[a_offset + ib].qs[sub * 2u + 1u] >> shift) & 0x0F0F0F0Fu;
+            const u8vec4 idx0 = unpack8(vui0);
+            const u8vec4 idx1 = unpack8(vui1);
+            const vec4 v      = vec4(float(kvalues_mxfp4[idx0.x]), float(kvalues_mxfp4[idx0.y]), float(kvalues_mxfp4[idx0.z]), float(kvalues_mxfp4[idx0.w]));
+            const vec4 v2     = vec4(float(kvalues_mxfp4[idx1.x]), float(kvalues_mxfp4[idx1.y]), float(kvalues_mxfp4[idx1.z]), float(kvalues_mxfp4[idx1.w]));
+            temp[j][n] = fma(FLOAT_TYPE(d), FLOAT_TYPE(dot(bv0, v) + dot(bv1, v2)), temp[j][n]);
+#else
             vec4 v = dequantize4(ib, iqs, a_offset);
             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
 
@@ -91,6 +103,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                 rowtmp *= dm.x;
 
             temp[j][n] += rowtmp;
+#endif
 #else
             if (!OOB_w) {
                 const vec4 v = dequantize4(ib, iqs, a_offset);

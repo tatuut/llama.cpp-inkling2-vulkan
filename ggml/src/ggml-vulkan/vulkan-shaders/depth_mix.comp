@@ -1,0 +1,165 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer States   { float data_states[];   };
+layout(binding = 0) readonly  buffer StatesV4 { vec4  data_states_v4[];};
+layout(binding = 1) readonly  buffer Query    { float data_query[];    };
+layout(binding = 1) readonly  buffer QueryV4  { vec4  data_query_v4[]; };
+layout(binding = 2) writeonly buffer Dst      { float data_dst[];      };
+layout(binding = 2) writeonly buffer DstV4    { vec4  data_dst_v4[];   };
+layout(binding = 3) readonly  buffer Cur      { float data_cur[];      };
+layout(binding = 3) readonly  buffer CurV4    { vec4  data_cur_v4[];   };
+
+layout(push_constant) uniform parameter {
+    uint D;
+    uint K;
+    uint Q;
+    uint T;
+    float scale;
+    uint has_cur;
+    float rms_eps;
+} p;
+
+shared float sh_sub[32][16];
+shared float sh_cur_sq[32];
+shared float sh_w[16];
+shared float sh_rms_scale;
+
+void main() {
+    const uint q   = gl_WorkGroupID.x;
+    const uint t   = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    if (q >= p.Q || t >= p.T) {
+        return;
+    }
+
+    const uint K      = p.K;
+    const uint K_prev = (p.has_cur != 0u) ? (K - 1u) : K;
+    float partial[16];
+    [[unroll]] for (uint k = 0; k < 16u; ++k) {
+        partial[k] = 0.0f;
+    }
+    float cur_sq = 0.0f;
+
+    if ((p.D & 3u) == 0u) {
+        const uint D4     = p.D >> 2;
+        const uint q_base = q * D4;
+        const uint s_base = t * K_prev * D4;
+        const uint c_base = t * D4;
+        for (uint i = tid; i < D4; i += 256u) {
+            const vec4 qv = data_query_v4[q_base + i];
+            for (uint k = 0; k < K_prev; ++k) {
+                partial[k] += dot(data_states_v4[s_base + k * D4 + i], qv);
+            }
+            if (p.has_cur != 0u) {
+                const vec4 cv = data_cur_v4[c_base + i];
+                partial[K_prev] += dot(cv, qv);
+                cur_sq += dot(cv, cv);
+            }
+        }
+    } else {
+        const uint q_base = q * p.D;
+        const uint s_base = t * K_prev * p.D;
+        const uint c_base = t * p.D;
+        for (uint i = tid; i < p.D; i += 256u) {
+            const float qv = data_query[q_base + i];
+            for (uint k = 0; k < K_prev; ++k) {
+                partial[k] += data_states[s_base + k * p.D + i] * qv;
+            }
+            if (p.has_cur != 0u) {
+                const float cv = data_cur[c_base + i];
+                partial[K_prev] += cv * qv;
+                cur_sq += cv * cv;
+            }
+        }
+    }
+
+    for (uint k = 0; k < K; ++k) {
+        const float sg_sum = subgroupAdd(partial[k]);
+        if (gl_SubgroupInvocationID == 0u) {
+            sh_sub[gl_SubgroupID][k] = sg_sum;
+        }
+    }
+    if (p.has_cur != 0u) {
+        const float sg_sq = subgroupAdd(cur_sq);
+        if (gl_SubgroupInvocationID == 0u) {
+            sh_cur_sq[gl_SubgroupID] = sg_sq;
+        }
+    }
+    barrier();
+
+    if (tid < K) {
+        float s = 0.0f;
+        for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+            s += sh_sub[sg][tid];
+        }
+        sh_w[tid] = s;
+    }
+    if (p.has_cur != 0u && tid == 16u) {
+        float tot_sq = 0.0f;
+        for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+            tot_sq += sh_cur_sq[sg];
+        }
+        sh_rms_scale = inversesqrt(tot_sq / float(p.D) + p.rms_eps);
+    }
+    barrier();
+
+    if (tid == 0u) {
+        if (p.has_cur != 0u) {
+            sh_w[K_prev] *= sh_rms_scale;
+        }
+        for (uint k = 0; k < K; ++k) {
+            sh_w[k] *= p.scale;
+        }
+        float max_v = sh_w[0];
+        for (uint k = 1; k < K; ++k) {
+            max_v = max(max_v, sh_w[k]);
+        }
+        float sum_w = 0.0f;
+        for (uint k = 0; k < K; ++k) {
+            const float w = exp(sh_w[k] - max_v);
+            sh_w[k] = w;
+            sum_w += w;
+        }
+        const float inv_sum = 1.0f / sum_w;
+        for (uint k = 0; k < K; ++k) {
+            sh_w[k] *= inv_sum;
+        }
+        if (p.has_cur != 0u) {
+            sh_w[K_prev] *= sh_rms_scale;
+        }
+    }
+    barrier();
+
+    if ((p.D & 3u) == 0u) {
+        const uint D4     = p.D >> 2;
+        const uint s_base = t * K_prev * D4;
+        const uint c_base = t * D4;
+        const uint d_base = (t * p.Q + q) * D4;
+        const float w_cur = (p.has_cur != 0u) ? sh_w[K_prev] : 0.0f;
+        for (uint i = tid; i < D4; i += 256u) {
+            vec4 acc = (p.has_cur != 0u) ? (vec4(w_cur) * data_cur_v4[c_base + i]) : vec4(0.0f);
+            for (uint k = 0; k < K_prev; ++k) {
+                acc = fma(vec4(sh_w[k]), data_states_v4[s_base + k * D4 + i], acc);
+            }
+            data_dst_v4[d_base + i] = acc;
+        }
+    } else {
+        const uint s_base = t * K_prev * p.D;
+        const uint c_base = t * p.D;
+        const uint d_base = (t * p.Q + q) * p.D;
+        const float w_cur = (p.has_cur != 0u) ? sh_w[K_prev] : 0.0f;
+        for (uint i = tid; i < p.D; i += 256u) {
+            float acc = (p.has_cur != 0u) ? (w_cur * data_cur[c_base + i]) : 0.0f;
+            for (uint k = 0; k < K_prev; ++k) {
+                acc = fma(sh_w[k], data_states[s_base + k * p.D + i], acc);
+            }
+            data_dst[d_base + i] = acc;
+        }
+    }
+}

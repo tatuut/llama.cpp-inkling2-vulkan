@@ -208,13 +208,41 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     if (scale) {
         cur = ggml_mul(ctx0, cur, scale);
     }
+    return ggml_l2_norm(ctx0, cur, -threshold);
+}
 
-    ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
-    norm = ggml_scale_bias(ctx0, norm, 1.0f, 1e-6f);
+static ggml_tensor * inkling2_norm_slice(ggml_context * ctx0, ggml_tensor * t, int64_t n_embd, int64_t n_tokens) {
+    return ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, t, n_embd, 1, n_tokens), 1e-6f);
+}
 
-    ggml_tensor * factor = ggml_div(ctx0, ggml_fill(ctx0, norm, threshold), norm);
+static ggml_tensor * inkling2_mix_from_states(
+        ggml_context * ctx0,
+        int64_t n_embd,
+        int64_t n_tokens,
+        ggml_tensor * states,
+        ggml_tensor * states_t,
+        ggml_tensor * query) {
+    ggml_tensor * queries = (n_tokens == 1)
+        ? ggml_reshape_3d(ctx0, query, n_embd, query->ne[1], 1)
+        : ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
 
-    return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
+    ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+    scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+
+    return ggml_mul_mat(ctx0, states_t, scores);
+}
+
+static ggml_tensor * inkling2_mix_stack(
+        ggml_context * ctx0,
+        int64_t n_embd,
+        int64_t n_tokens,
+        ggml_tensor * blocks_stack,
+        ggml_tensor * cur,
+        ggml_tensor * query) {
+    ggml_tensor * cur_norm = inkling2_norm_slice(ctx0, cur, n_embd, n_tokens);
+    ggml_tensor * states   = blocks_stack ? ggml_concat(ctx0, blocks_stack, cur_norm, 1) : cur_norm;
+    ggml_tensor * states_t = ggml_cont(ctx0, ggml_transpose(ctx0, states));
+    return inkling2_mix_from_states(ctx0, n_embd, n_tokens, states, states_t, query);
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
@@ -224,13 +252,8 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
         states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
     }
     states = ggml_rms_norm(ctx0, states, 1e-6f);
-
-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
-
-    ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
-    scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
-
-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
+    ggml_tensor * states_t = ggml_cont(ctx0, ggml_transpose(ctx0, states));
+    return inkling2_mix_from_states(ctx0, n_embd, n_tokens, states, states_t, query);
 }
 
 // loop message controller: (1 - tanh(F h))*cur + tanh(G h)*message, h = D [rms(cur); rms(message)]; module: q, k, v, mlp
@@ -239,10 +262,17 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
     h = ggml_reshape_2d(ctx0, ggml_rms_norm(ctx0, h, 1e-6f), 2*n_embd, n_tokens);
     h = build_lora_mm(layer.loop_down[module], h);
 
-    ggml_tensor * gain   = ggml_tanh(ctx0, build_lora_mm(layer.loop_gain[module],   h));
-    ggml_tensor * forget = ggml_tanh(ctx0, build_lora_mm(layer.loop_forget[module], h));
+    // Issue gain and forget projections back-to-back on the shared input `h`, then expand both so the 6-op control gate stays contiguous
+    ggml_tensor * gain_raw   = build_lora_mm(layer.loop_gain[module],   h);
+    ggml_tensor * forget_raw = build_lora_mm(layer.loop_forget[module], h);
+    ggml_build_forward_expand(gf, gain_raw);
+    ggml_build_forward_expand(gf, forget_raw);
+    ggml_tensor * gain   = ggml_tanh(ctx0, gain_raw);
+    ggml_tensor * forget = ggml_tanh(ctx0, forget_raw);
 
-    return ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, forget, -1.0f, 1.0f), cur), ggml_mul(ctx0, gain, message));
+    ggml_tensor * out = ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, forget, -1.0f, 1.0f), cur), ggml_mul(ctx0, gain, message));
+    ggml_build_forward_expand(gf, out);
+    return out;
 }
 
 // causal short convolution with a residual; dynamic adds input-dependent taps per head
@@ -266,6 +296,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
     x = ggml_concat(ctx0, past, x, 0);
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
+
+    if (dynamic) {
+        ggml_build_forward_expand(gf, dynamic);
+    }
 
     ggml_tensor * out = ggml_ssm_conv(ctx0, x, weight);
     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
@@ -304,7 +338,20 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         const auto * cache = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
         const int64_t hd = hparams.n_embd_head_k(il);
         const auto type_ok = [](ggml_type t) {
-            return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+            switch (t) {
+                case GGML_TYPE_F32:
+                case GGML_TYPE_F16:
+                case GGML_TYPE_BF16:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q5_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_IQ4_NL:
+                    return true;
+                default:
+                    return false;
+            }
         };
         if (!(inp->n_kv_banded[swa] > 0 && (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd &&
                 type_ok(cache->type_k()) && type_ok(cache->type_v()) && !cache->get_k_scale(il) && !cache->get_v_scale(il) &&
@@ -351,15 +398,18 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cur = build_norm(cur, model.tok_norm, nullptr, LLM_NORM_RMS, -1);
     }
 
-    std::vector<ggml_tensor *> blocks;
+    std::vector<ggml_tensor *> blocks_norm;
+    ggml_tensor *              blocks_stack = nullptr;
 
     // each pass of the looped core restarts from the prelude state and reads the previous pass's blocks through messages
     const int64_t n_loop_core = hparams.loop_n_pass > 1 ? hparams.loop_core_end - hparams.loop_core_start : 0;
 
-    std::vector<ggml_tensor *> prelude_blocks;
+    std::vector<ggml_tensor *> prelude_blocks_norm;
+    ggml_tensor *              prelude_blocks_stack = nullptr;
     ggml_tensor *              prelude_cur = nullptr;
-    std::vector<ggml_tensor *> bank;
-    ggml_tensor *              bank_last = nullptr;
+    ggml_tensor *              m_attn_pass = nullptr;
+    ggml_tensor *              m_kv_pass   = nullptr;
+    ggml_tensor *              zero_sinks  = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -372,29 +422,34 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
             if (ip == (int) hparams.loop_core_start) {
                 if (pass == 0) {
-                    prelude_blocks = blocks;
-                    prelude_cur    = cur;
+                    prelude_blocks_norm  = blocks_norm;
+                    prelude_blocks_stack = blocks_stack;
+                    prelude_cur          = cur;
                 } else {
-                    bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
-                    bank_last = cur;
-                    blocks    = prelude_blocks;
-                    cur       = prelude_cur;
+                    ggml_tensor * bank_stack = nullptr;
+                    for (size_t bi = prelude_blocks_norm.size() + 1; bi < blocks_norm.size(); ++bi) {
+                        bank_stack = bank_stack ? ggml_concat(ctx0, blocks_norm[bi], bank_stack, 1) : blocks_norm[bi];
+                    }
+                    ggml_tensor * last_norm     = inkling2_norm_slice(ctx0, cur, n_embd, n_tokens);
+                    ggml_tensor * pass_states   = bank_stack ? ggml_concat(ctx0, bank_stack, last_norm, 1) : last_norm;
+                    ggml_tensor * pass_states_t = ggml_cont(ctx0, ggml_transpose(ctx0, pass_states));
+                    blocks_norm  = prelude_blocks_norm;
+                    blocks_stack = prelude_blocks_stack;
+                    cur          = prelude_cur;
+                    m_attn_pass = inkling2_mix_from_states(ctx0, n_embd, n_tokens, pass_states, pass_states_t, model.loop_res_query);
+                    m_kv_pass   = inkling2_mix_from_states(ctx0, n_embd, n_tokens, pass_states, pass_states_t, model.loop_kv_res_query);
                 }
             }
 
             if (pass > 0) {
                 const int64_t row = 2*(ip - (int) hparams.loop_core_start);
 
-                ggml_tensor * q_attn = ggml_view_2d(ctx0, model.loop_res_query,    n_embd, 2, model.loop_res_query->nb[1],    row*model.loop_res_query->nb[1]);
-                ggml_tensor * q_kv   = ggml_view_2d(ctx0, model.loop_kv_res_query, n_embd, 2, model.loop_kv_res_query->nb[1], row*model.loop_kv_res_query->nb[1]);
-
                 // rows: (attn, mlp) and (k, v)
-                ggml_tensor * m_attn = mix(bank, bank_last, q_attn);
-                ggml_tensor * m_kv   = mix(bank, bank_last, q_kv);
-
                 for (int j = 0; j < 2; ++j) {
-                    messages[j == 0 ? 0 : 3] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_attn, n_embd, n_tokens, m_attn->nb[2], j*m_attn->nb[1]));
-                    messages[j == 0 ? 1 : 2] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_kv,   n_embd, n_tokens, m_kv->nb[2],   j*m_kv->nb[1]));
+                    ggml_tensor * ma = ggml_view_2d(ctx0, m_attn_pass, n_embd, n_tokens, m_attn_pass->nb[2], (row + j)*m_attn_pass->nb[1]);
+                    ggml_tensor * mk = ggml_view_2d(ctx0, m_kv_pass,   n_embd, n_tokens, m_kv_pass->nb[2],   (row + j)*m_kv_pass->nb[1]);
+                    messages[j == 0 ? 0 : 3] = n_tokens == 1 ? ma : ggml_cont(ctx0, ma);
+                    messages[j == 0 ? 1 : 2] = n_tokens == 1 ? mk : ggml_cont(ctx0, mk);
                 }
             }
         }
@@ -416,9 +471,14 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
         ggml_tensor * inputs[3] = {cur, cur, cur};
         if (layer.attn_res_query) {
-            ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-            for (int j = 0; j < 3; ++j) {
-                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            ggml_tensor * mixed = inkling2_mix_stack(ctx0, n_embd, n_tokens, blocks_stack, cur, layer.attn_res_query);
+            if (is_swa) {
+                inputs[0] = inputs[1] = inputs[2] = ggml_reshape_2d(ctx0, mixed, n_embd, n_tokens);
+            } else {
+                for (int j = 0; j < 3; ++j) {
+                    ggml_tensor * mv = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]);
+                    inputs[j] = n_tokens == 1 ? mv : ggml_cont(ctx0, mv);
+                }
             }
         }
 
@@ -445,12 +505,15 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
         // self-attention
         {
+            // Issue inputs[0] projections back-to-back so Vulkan batches them without intermediate barriers
             ggml_tensor * Qcur = build_lora_mm(layer.wq, inputs[0]);
+            ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
+            ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
+            ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, inputs[0]);
             ggml_tensor * Kcur = convolve(build_lora_mm(layer.wk, inputs[1]), layer.attn_k_conv,
                     is_swa ? nullptr : build_lora_mm(layer.attn_k_conv_proj, inputs[1]), state, history, recr, 0);
             ggml_tensor * Vcur = convolve(build_lora_mm(layer.wv, inputs[2]), layer.attn_v_conv,
                     is_swa ? nullptr : build_lora_mm(layer.attn_v_conv_proj, inputs[2]), state, history, recr, n_embd_k_gqa);
-            ggml_tensor * Rcur = build_lora_mm(layer.attn_rel, inputs[0]);
 
             Qcur = clip(ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), layer.attn_q_clip, hparams.f_qk_clip);
             Kcur = clip(ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), nullptr,           hparams.f_qk_clip);
@@ -471,8 +534,6 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
 
             const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
             const int64_t n_kv     = rel_pos->ne[0];
-
-            ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
             if (use_banded(il, is_swa)) {
                 const auto * cache = is_swa ? attn->mctx->get_swa() : attn->mctx->get_base();
@@ -523,6 +584,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                     cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
                 }
             } else {
+                // Expand Rcur and sinks before building table so the 10-op relative-bias pattern stays contiguous
+                ggml_build_forward_expand(gf, Rcur);
+                ggml_build_forward_expand(gf, sinks);
+
                 // project before gathering: only the gathered bias is n_kv x n_tokens x n_head
                 ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
@@ -530,7 +595,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
                 table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
-                sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+                if (!zero_sinks || zero_sinks->ne[0] != n_head) {
+                    zero_sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+                }
+                sinks = zero_sinks;
 
                 // dense bias is n_kv x n_tokens x n_head: chunk query rows past the budget
                 const int64_t n_seq_tokens = n_tokens/n_stream;
@@ -592,14 +660,18 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                 cur = n_rows_max >= n_seq_tokens ? outs[0] : ggml_reshape_2d(ctx0, outs[0], outs[0]->ne[0], n_tokens);
             }
 
-            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, gate);
+            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
             cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
             cb(cur, "attn_out", il);
         }
 
         // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
         if (ip % hparams.attn_res_block_size == 0) {
-            blocks.push_back(inpSA);
+            ggml_tensor * bn = inkling2_norm_slice(ctx0, inpSA, n_embd, n_tokens);
+            blocks_norm.push_back(bn);
+            blocks_stack = blocks_stack ? ggml_concat(ctx0, bn, blocks_stack, 1) : bn;
         } else {
             cur = ggml_add(ctx0, inpSA, cur);
         }
@@ -608,7 +680,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cb(ffn_inp, "ffn_inp", il);
 
         // MoE
-        cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
+        cur = ggml_reshape_2d(ctx0, inkling2_mix_stack(ctx0, n_embd, n_tokens, blocks_stack, cur, layer.ffn_res_query), n_embd, n_tokens);
         if (messages[3]) {
             cur = control(cur, messages[3], layer, 3);
             cb(cur, "loop_ffn_inp", il);
@@ -640,7 +712,7 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cb(cur, "l_out", il);
     }
 
-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
+    cur = ggml_reshape_2d(ctx0, inkling2_mix_stack(ctx0, n_embd, n_tokens, blocks_stack, cur, model.output_res_query), n_embd, n_tokens);
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 
     res->t_layer_inp[n_layer] = cur;

@@ -183,8 +183,8 @@ void main() {
         Mf[r] = NEG_FLT_MAX_OVER_2;
     }
 
-    // ALiBi
-    if (p.max_bias > 0.0f) {
+    // ALiBi (disabled when USE_BANDED repurposes p.max_bias)
+    if (!USE_BANDED && p.max_bias > 0.0f) {
         if (tid < Br) {
             uint r = tid;
             slope[r] = perElemOpComputeSlope(r, col_tid, ACC_TYPE(0), iq2);
@@ -413,16 +413,40 @@ void main() {
             barrier();
         }
 
-        if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+        const bool apply_mask = MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO;
+        bool tile_has_banded = false;
+        if (USE_BANDED) {
+            const uint32_t q_min = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br);
+            const uint32_t q_max = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br + Br - 1u);
+            const int32_t min_rel_dist = int32_t(q_min) + int32_t(KV) - int32_t(p.ne2) - int32_t(j * Bc + Bc - 1u);
+            const int32_t max_rel_dist = int32_t(q_max) + int32_t(KV) - int32_t(p.ne2) - int32_t(j * Bc);
+            tile_has_banded = (max_rel_dist >= 0) && (min_rel_dist < int32_t(floatBitsToUint(p.max_bias)));
+        }
+        if (apply_mask || tile_has_banded) {
             [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t c = (idx + tid) / (Br / 4);
                 uint32_t r = (idx + tid) % (Br / 4);
                 if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
-                    if (!KV_bounds_check || j * Bc + c < KV) {
-                        // Mask nem1 bounds check is handled when loading masks
-                        ACC_TYPEV4 masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
-                        ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
-                        sfsh[c * sfshstride + r] += slopes * masks;
+                    const uint32_t kv_col = j * Bc + c;
+                    if (!KV_bounds_check || kv_col < KV) {
+                        ACC_TYPEV4 delta = ACC_TYPEV4(0);
+                        if (apply_mask) {
+                            // Mask nem1 bounds check is handled when loading masks
+                            ACC_TYPEV4 masks = ACC_TYPEV4(mask_cache[idx / WorkGroupSize]);
+                            ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
+                            delta += slopes * masks;
+                        }
+                        if (USE_BANDED) {
+                            ACC_TYPEV4 rb;
+                            [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+                                const uint32_t row   = r * 4 + k;
+                                const uint32_t q_idx = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br + row);
+                                const uint32_t h     = iq2 + ((p.gqa_ratio > 1) ? row : 0u);
+                                rb[k] = ACC_TYPE(get_banded_rel_bias(q_idx, h, kv_col));
+                            }
+                            delta += rb;
+                        }
+                        sfsh[c * sfshstride + r] += delta;
                     }
                 }
             }

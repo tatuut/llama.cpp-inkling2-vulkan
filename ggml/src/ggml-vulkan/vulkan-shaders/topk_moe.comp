@@ -198,7 +198,7 @@ void main() {
 
     if (with_norm != 0) {
         wt_sum              = subgroupAdd(wt_sum);
-        wt_sum              = clamp(wt_sum, clamp_min, clamp_max);
+        wt_sum              = (clamp_min < 0.0f) ? (wt_sum - clamp_min) : clamp(wt_sum, clamp_min, clamp_max);
         const float inv_sum = 1.0f / wt_sum;
 
         [[unroll]]

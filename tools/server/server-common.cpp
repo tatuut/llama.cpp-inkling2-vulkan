@@ -1654,6 +1654,10 @@ json oaicompat_chat_params_parse(
         }
     }
 
+    if (inputs.enable_thinking && inputs.chat_template_kwargs.count("reasoning_effort") == 0) {
+        inputs.chat_template_kwargs["reasoning_effort"] = "\"low\"";
+    }
+
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages

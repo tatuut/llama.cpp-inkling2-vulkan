@@ -1,0 +1,90 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "mul_mat_vec_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// Paired-lane NVFP4 matrix-vector kernel:
+//   even thread (half_lane = 0): qs[sub*2 + 0] -> elements  0..3 (bv_lo) and  8..11 (bv_hi)
+//   odd  thread (half_lane = 1): qs[sub*2 + 1] -> elements  4..7 (bv_lo) and 12..15 (bv_hi)
+// Every lane performs a single sequential 32-bit qs load across the subgroup (zero duplicate loads),
+// zero shared-memory LUTs, zero startup barriers, and IEEE-exact FP32 ALU dequantization.
+#define K_PER_ITER 8
+
+uint a_offset, b_offset, d_offset;
+
+void iter_nvfp4(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint iter_idx) {
+    const uint sub_col        = iter_idx * (K_PER_ITER * BLOCK_SIZE) + (tid >> 1) * 16u;
+    const uint half_lane      = tid & 1u;
+    const uint ib             = sub_col >> 6;
+    const uint sub            = (sub_col >> 4) & 3u;
+    const uint qs_word        = sub * 2u + half_lane;
+    const uint row_blk_stride = p.ncols >> 6;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint b_base = (j * p.batch_stride_b + b_offset + sub_col) >> 2;
+        const vec4 bv_lo  = vec4(data_b_v4[b_base + half_lane]);
+        const vec4 bv_hi  = vec4(data_b_v4[b_base + half_lane + 2u]);
+
+        uint a_blk = a_offset + first_row * row_blk_stride + ib;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint  d_byte = (data_a_packed32[a_blk].d[0] >> (sub * 8u)) & 0xFFu;
+            const float d      = ue4m3_half_to_fp32_uint(d_byte);
+            const uint  q      = data_a_packed32[a_blk].qs[qs_word];
+            const float s      = dot(bv_lo, fe2m1x4_doubled( q        & 0x0F0F0F0Fu))
+                               + dot(bv_hi, fe2m1x4_doubled((q >> 4u) & 0x0F0F0F0Fu));
+            temp[j][n] = fma(FLOAT_TYPE(d), FLOAT_TYPE(s), temp[j][n]);
+            a_blk += row_blk_stride;
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+
+    const uint stride    = K_PER_ITER * BLOCK_SIZE;
+    const uint num_iters = p.ncols / stride;
+
+    uint i = 0;
+    const uint unroll4 = num_iters & ~3u;
+    while (i < unroll4) {
+        [[unroll]] for (uint k = 0; k < 4u; ++k) {
+            iter_nvfp4(temp, first_row, num_rows, tid, i + k);
+        }
+        i += 4u;
+    }
+    while (i < num_iters) {
+        iter_nvfp4(temp, first_row, num_rows, tid, i);
+        i++;
+    }
+
+    const uint tail_sub_col = num_iters * stride + (tid >> 1) * 16u;
+    if (tail_sub_col < p.ncols) {
+        iter_nvfp4(temp, first_row, num_rows, tid, num_iters);
+    }
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
+    }
+}

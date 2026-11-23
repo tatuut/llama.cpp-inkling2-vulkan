@@ -206,6 +206,16 @@ ACC_TYPE faAddSparseMask(const uint32_t row, const uint32_t col, const ACC_TYPE 
     return r < 0 ? ACC_TYPE_NEG : elem + ACC_TYPE(data_mf16[g_m_off_elem + row * m_stride + uint(r)]);
 }
 
+ACC_TYPE faAddBandedBias(const uint32_t row, const uint32_t col, const ACC_TYPE elem, const uint32_t jblk) {
+    const uint32_t kv_col = jblk * Bc + col;
+    if (KV_bounds_check && kv_col >= KV) {
+        return elem;
+    }
+    const uint32_t q_idx = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br + row);
+    const uint32_t h     = iq2 + ((p.gqa_ratio > 1) ? row : 0u);
+    return elem + ACC_TYPE(get_banded_rel_bias(q_idx, h, kv_col));
+}
+
 ACC_TYPE maxReduce(const in ACC_TYPE x, const in ACC_TYPE y) {
     return max(x, y);
 }
@@ -335,7 +345,7 @@ void main() {
     coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator> slopeMat = coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(1.0);
 
     // ALiBi
-    if (p.max_bias > 0.0f) {
+    if (!USE_BANDED && p.max_bias > 0.0f) {
         coopMatPerElementNV(slopeMat, slopeMat, perElemOpComputeSlope, iq2);
     }
 
@@ -436,6 +446,16 @@ void main() {
             coopMatPerElementNV(S, S, faAddSparseMask, j);
         } else if (MASK_ENABLE) {
             S += slopeMat*coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, Bc, gl_MatrixUseAccumulator>(mv);
+        }
+
+        if (USE_BANDED) {
+            const uint32_t q_min = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br);
+            const uint32_t q_max = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br + Br - 1u);
+            const int32_t min_rel_dist = int32_t(q_min) + int32_t(KV) - int32_t(p.ne2) - int32_t(j * Bc + Bc - 1u);
+            const int32_t max_rel_dist = int32_t(q_max) + int32_t(KV) - int32_t(p.ne2) - int32_t(j * Bc);
+            if (max_rel_dist >= 0 && min_rel_dist < int32_t(floatBitsToUint(p.max_bias))) {
+                coopMatPerElementNV(S, S, faAddBandedBias, j);
+            }
         }
 
         // Clear padding elements to -inf, so they don't contribute to rowmax

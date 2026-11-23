@@ -1,0 +1,36 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Bias   { float data_bias[];  };
+layout(binding = 1) readonly  buffer Rcur   { float data_rcur[];  };
+layout(binding = 2) readonly  buffer Sinks  { float data_sinks[]; };
+layout(binding = 3) readonly  buffer RelPos { int   data_rpos[];  };
+layout(binding = 4) writeonly buffer Dst    { float data_dst[];   };
+
+layout(push_constant) uniform parameter {
+    uint n_rel;
+    uint n_extent;
+    uint n_kv;
+    uint n_head;
+    uint n_tok;
+} p;
+
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    const uint h = gl_WorkGroupID.y;
+    const uint t = gl_WorkGroupID.z;
+    if (k >= p.n_kv || h >= p.n_head || t >= p.n_tok) {
+        return;
+    }
+    const int idx = data_rpos[t * p.n_kv + k];
+    float acc = 0.0f;
+    if (idx >= 0 && uint(idx) < p.n_extent) {
+        const uint b_off = uint(idx) * p.n_rel;
+        const uint r_off = (t * p.n_head + h) * p.n_rel;
+        for (uint r = 0; r < p.n_rel; ++r) {
+            acc += data_bias[b_off + r] * data_rcur[r_off + r];
+        }
+    }
+    data_dst[(h * p.n_tok + t) * p.n_kv + k] = acc - data_sinks[t * p.n_head + h];
+}

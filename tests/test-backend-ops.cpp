@@ -13692,6 +13692,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1,   1, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
 
+    for (ggml_type qtype : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int sinks : { 1, 2 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 4,   1,  256,  128, 1, qtype, GGML_TYPE_F32, sinks));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 4,   4,  256,  128, 2, qtype, GGML_TYPE_F32, sinks));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 4,  64, 1024,  512, 1, qtype, GGML_TYPE_F32, sinks));
+            test_cases.emplace_back(new test_flash_attn_ext_banded_sinks(128, 24, 4, 512, 2048, 1024, 2, qtype, GGML_TYPE_F16, sinks));
+        }
+    }
+
     // mask broadcast over Q heads and batches
     for (bool sinks : { false, true }) {
         for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {

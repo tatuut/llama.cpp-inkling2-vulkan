@@ -1907,6 +1907,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_weights);
 
+    // Keep inkling2 token_embd on the first GPU device when offloaded so decoding stays in a single split
+    if (arch == LLM_ARCH_INKLING2 && !pimpl->dev_layer.empty() && pimpl->dev_layer[0].dev != cpu_dev) {
+        pimpl->dev_input = pimpl->dev_layer[0];
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights

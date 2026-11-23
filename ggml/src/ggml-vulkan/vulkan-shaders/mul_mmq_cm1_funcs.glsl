@@ -471,17 +471,15 @@ struct block_a_prefetch {
 
 block_a_prefetch block_a_load(uint ib, uint loadr) {
     block_a_prefetch blk;
-    const uint ib_k = ib / 2;
-    const uint ihalf = ib % 2;
-    const uint sub = ihalf * 2 + (loadr >> 1);
+    const uint ib_k = ib >> 1;
+    const uint ihalf = ib & 1u;
+    const uint sub = ihalf * 2u + (loadr >> 1);
     const uint byte_group = loadr & 1u;
 
-    blk.qs = pack32(u8vec4(data_a[ib_k].qs[sub * 8 + byte_group * 4],
-                            data_a[ib_k].qs[sub * 8 + byte_group * 4 + 1],
-                            data_a[ib_k].qs[sub * 8 + byte_group * 4 + 2],
-                            data_a[ib_k].qs[sub * 8 + byte_group * 4 + 3]));
-    blk.d0 = data_a[ib_k].d[ihalf * 2];
-    blk.d1 = data_a[ib_k].d[ihalf * 2 + 1];
+    blk.qs = data_a_packed32[ib_k].qs[sub * 2u + byte_group];
+    const uint d_packed = data_a_packed32[ib_k].d[0] >> (ihalf * 16u);
+    blk.d0 = uint8_t(d_packed & 0xFFu);
+    blk.d1 = uint8_t((d_packed >> 8u) & 0xFFu);
 
     return blk;
 }

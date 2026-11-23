@@ -1,0 +1,80 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+// Fused control() back-end:
+//   gain_raw   = W_gain   * h
+//   forget_raw = W_forget * h
+//   dst        = (1 - tanh(forget_raw)) * cur + tanh(gain_raw) * msg
+// Workgroup: 256 threads = 16 output rows x 16 lanes per row.
+// When R == 64 (R4 == 16), 4 rows x 16 lanes in each Wave64 read 64 consecutive vec4s (1024B)
+// from W_gain and W_forget with 100% memory coalescing and zero loop overhead.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Cur       { float data_cur[];       };
+layout(binding = 1) readonly  buffer Msg       { float data_msg[];       };
+layout(binding = 2) readonly  buffer HV4       { vec4  data_h_v4[];      };
+layout(binding = 3) readonly  buffer WGainV4   { vec4  data_wgain_v4[];  };
+layout(binding = 4) readonly  buffer WForgetV4 { vec4  data_wforget_v4[];};
+layout(binding = 5) writeonly buffer Dst       { float data_dst[];       };
+
+layout(push_constant) uniform PushConstants {
+    uint D;
+    uint R;
+    uint T;
+} p;
+
+shared vec4 sh_h[64];
+
+void main() {
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint lane    = tid & 15u;
+    const uint r_local = tid >> 4;
+    const uint d       = gl_WorkGroupID.x * 16u + r_local;
+    const uint t       = gl_WorkGroupID.y;
+
+    if (t >= p.T) {
+        return;
+    }
+
+    const uint R4     = p.R >> 2;
+    const uint h_base = t * R4;
+    if (R4 <= 64u) {
+        for (uint k = tid; k < R4; k += 256u) {
+            sh_h[k] = data_h_v4[h_base + k];
+        }
+        barrier();
+    }
+
+    vec2 gf = vec2(0.0f);
+    if (d < p.D) {
+        const uint w_base = d * R4;
+        if (R4 <= 64u) {
+            for (uint k = lane; k < R4; k += 16u) {
+                const vec4 hv = sh_h[k];
+                gf.x += dot(data_wgain_v4[w_base + k],   hv);
+                gf.y += dot(data_wforget_v4[w_base + k], hv);
+            }
+        } else {
+            for (uint k = lane; k < R4; k += 16u) {
+                const vec4 hv = data_h_v4[h_base + k];
+                gf.x += dot(data_wgain_v4[w_base + k],   hv);
+                gf.y += dot(data_wforget_v4[w_base + k], hv);
+            }
+        }
+    }
+
+    gf += subgroupShuffleXor(gf, 8u);
+    gf += subgroupShuffleXor(gf, 4u);
+    gf += subgroupShuffleXor(gf, 2u);
+    gf += subgroupShuffleXor(gf, 1u);
+
+    if (lane == 0u && d < p.D) {
+        const uint idx   = t * p.D + d;
+        const float gain = tanh(gf.x);
+        const float fgt  = tanh(gf.y);
+        data_dst[idx]    = (1.0f - fgt) * data_cur[idx] + gain * data_msg[idx];
+    }
+}

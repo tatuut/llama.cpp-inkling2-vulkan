@@ -809,6 +809,54 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+    float scale;
+};
+
+struct vk_op_control_gate_push_constants {
+    uint32_t ne;
+};
+
+struct vk_op_inkling_rel_bias_push_constants {
+    uint32_t n_rel;
+    uint32_t n_extent;
+    uint32_t n_kv;
+    uint32_t n_head;
+    uint32_t n_tok;
+};
+
+struct vk_op_depth_mix_push_constants {
+    uint32_t D;
+    uint32_t K;
+    uint32_t Q;
+    uint32_t T;
+    float scale;
+    uint32_t has_cur;
+    float rms_eps;
+};
+
+struct vk_op_ssm_conv_dyn_push_constants {
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb11;
+    uint32_t nr;
+    uint32_t n_t;
+    uint32_t n_s;
+    uint32_t n_heads;
+    uint32_t head_dim;
+    float scale;
+};
+
+struct vk_op_loop_norm_down_push_constants {
+    uint32_t D;
+    uint32_t R;
+    uint32_t T;
+    float rms_eps;
+};
+
+struct vk_op_loop_up_gate_push_constants {
+    uint32_t D;
+    uint32_t R;
+    uint32_t T;
 };
 
 struct vk_op_conv2d_push_constants {

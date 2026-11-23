@@ -163,20 +163,10 @@ void main() {
         cm1_kvalues[gl_LocalInvocationIndex] = kvalues_iq4nl_const[gl_LocalInvocationIndex];
     }
     barrier();
-#elif defined(DATA_A_MXFP4)
+#elif defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
     if (gl_LocalInvocationIndex < 16u) {
         cm1_kvalues[gl_LocalInvocationIndex] = kvalues_mxfp4_const[gl_LocalInvocationIndex];
     }
-    barrier();
-#elif defined(DATA_A_NVFP4)
-    if (gl_LocalInvocationIndex < 16u) {
-        cm1_kvalues[gl_LocalInvocationIndex] = kvalues_mxfp4_const[gl_LocalInvocationIndex];
-    }
-#if !defined(USE_OCP_FP4)
-    for (uint i = gl_LocalInvocationIndex; i < 256u; i += BLOCK_SIZE) {
-        ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
-    }
-#endif
     barrier();
 #endif
 

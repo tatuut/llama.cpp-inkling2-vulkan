@@ -100,6 +100,21 @@ common_chat_params common_chat_params_init_inkling(const common_chat_template & 
     auto use_tools           = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
 
+    bool effort_none = false;
+    if (inputs.extra_context.contains("reasoning_effort")) {
+        const auto & re = inputs.extra_context.at("reasoning_effort");
+        if (re.is_string()) {
+            const std::string s = re.get<std::string>();
+            effort_none = (s == "none" || s == "0" || s == "0.0");
+        } else if (re.is_number()) {
+            effort_none = (re.get<double>() <= 0.0);
+        }
+    }
+    if (!inputs.has_continuation() && inputs.add_generation_prompt && (!inputs.enable_thinking || effort_none) && !use_tools) {
+        data.generation_prompt += HEADER + TEXT;
+        data.prompt.append(HEADER + TEXT);
+    }
+
     data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto header = p.literal(HEADER);
         auto end    = p.literal(END);

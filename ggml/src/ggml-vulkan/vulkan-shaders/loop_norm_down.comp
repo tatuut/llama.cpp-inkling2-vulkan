@@ -1,0 +1,120 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Fused control() front-end:
+//   h = W_down * [rms_norm(cur); rms_norm(msg)]
+// Workgroup: 64 threads, computing 4 output rows of h [R, T] per workgroup.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer CurV4   { vec4  data_cur_v4[]; };
+layout(binding = 1) readonly  buffer MsgV4   { vec4  data_msg_v4[]; };
+layout(binding = 2) readonly  buffer WDownV4 { vec4  data_w_v4[];   };
+layout(binding = 3) writeonly buffer Dst     { float data_dst[];    };
+
+layout(push_constant) uniform PushConstants {
+    uint D;
+    uint R;
+    uint T;
+    float rms_eps;
+} p;
+
+shared vec2 sh_sq[8];
+shared vec4 sh_acc[8];
+shared vec2 sh_inv_rms;
+
+void main() {
+    const uint first_row = gl_WorkGroupID.x * 4u;
+    const uint t         = gl_WorkGroupID.y;
+    const uint tid       = gl_LocalInvocationID.x;
+
+    if (first_row >= p.R || t >= p.T) {
+        return;
+    }
+
+    const uint D4     = p.D >> 2;
+    const uint W4_row = D4 * 2u;
+    const uint c_base = t * D4;
+
+    float sq_cur = 0.0f;
+    float sq_msg = 0.0f;
+    for (uint i = tid; i < D4; i += 64u) {
+        const vec4 cv = data_cur_v4[c_base + i];
+        const vec4 mv = data_msg_v4[c_base + i];
+        sq_cur += dot(cv, cv);
+        sq_msg += dot(mv, mv);
+    }
+
+    vec2 sq_pair = subgroupAdd(vec2(sq_cur, sq_msg));
+    float inv_rms_cur;
+    float inv_rms_msg;
+
+    if (gl_NumSubgroups == 1u) {
+        inv_rms_cur = inversesqrt(sq_pair.x / float(p.D) + p.rms_eps);
+        inv_rms_msg = inversesqrt(sq_pair.y / float(p.D) + p.rms_eps);
+    } else {
+        if (gl_SubgroupInvocationID == 0u) {
+            sh_sq[gl_SubgroupID] = sq_pair;
+        }
+        barrier();
+        if (tid == 0u) {
+            vec2 tot = vec2(0.0f);
+            for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+                tot += sh_sq[sg];
+            }
+            sh_inv_rms = inversesqrt(tot / float(p.D) + vec2(p.rms_eps));
+        }
+        barrier();
+        inv_rms_cur = sh_inv_rms.x;
+        inv_rms_msg = sh_inv_rms.y;
+    }
+
+    const uint num_rows = min(4u, p.R - first_row);
+    vec4 acc = vec4(0.0f);
+
+    for (uint i = tid; i < D4; i += 64u) {
+        const vec4 cv = data_cur_v4[c_base + i] * inv_rms_cur;
+        [[unroll]] for (uint n = 0; n < 4u; ++n) {
+            if (n < num_rows) {
+                acc[n] += dot(data_w_v4[(first_row + n) * W4_row + i], cv);
+            }
+        }
+    }
+    for (uint i = tid; i < D4; i += 64u) {
+        const vec4 mv = data_msg_v4[c_base + i] * inv_rms_msg;
+        [[unroll]] for (uint n = 0; n < 4u; ++n) {
+            if (n < num_rows) {
+                acc[n] += dot(data_w_v4[(first_row + n) * W4_row + D4 + i], mv);
+            }
+        }
+    }
+
+    vec4 sum_acc = subgroupAdd(acc);
+    if (gl_NumSubgroups == 1u) {
+        if (tid == 0u) {
+            [[unroll]] for (uint n = 0; n < 4u; ++n) {
+                if (n < num_rows) {
+                    data_dst[t * p.R + first_row + n] = sum_acc[n];
+                }
+            }
+        }
+    } else {
+        if (gl_SubgroupInvocationID == 0u) {
+            sh_acc[gl_SubgroupID] = sum_acc;
+        }
+        barrier();
+        if (tid == 0u) {
+            vec4 tot = vec4(0.0f);
+            for (uint sg = 0; sg < gl_NumSubgroups; ++sg) {
+                tot += sh_acc[sg];
+            }
+            [[unroll]] for (uint n = 0; n < 4u; ++n) {
+                if (n < num_rows) {
+                    data_dst[t * p.R + first_row + n] = tot[n];
+                }
+            }
+        }
+    }
+}

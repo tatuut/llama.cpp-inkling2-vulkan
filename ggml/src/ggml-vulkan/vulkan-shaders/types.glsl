@@ -1920,38 +1920,14 @@ const int8_t kvalues_mxfp4_const[16] = {
 shared int8_t kvalues_mxfp4[16];
 #endif
 
-#if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)
-// Cover all scale bytes accepted by ggml_validate_row_data.
-// ue4m3_to_fp32_build() masks the exponent and mantissa, but checks the full byte for 0 and 0x7F.
-shared float ue4m3_fp32_lut[256];
-
-float ue4m3_to_fp32_build(uint u) {
-    if (u == 0u || u == 127u) {
-        return 0.0;
-    }
-    const uint exp = (u >> 3) & 15u;
-    const uint man = u & 7u;
-    if (exp == 0u) {
-        return float(man) * (1.0 / 512.0);
-    }
-    const uint bits = (exp + 120u) << 23 | (man << 20);
-    return uintBitsToFloat(bits);
-}
-#endif
-
 #if (defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)) && !defined(USE_OCP_FP4)
 #define NEEDS_INIT_IQ_SHMEM
 void init_iq_shmem(uvec3 wgsize)
 {
-    // copy the table into shared memory and sync
+    // copy the 16-entry mxfp4 table into shared memory and sync
     for (uint i = gl_LocalInvocationIndex.x; i < kvalues_mxfp4.length(); i += wgsize.x) {
         kvalues_mxfp4[i] = kvalues_mxfp4_const[i];
     }
-#if defined(DATA_A_NVFP4)
-    for (uint i = gl_LocalInvocationIndex.x; i < 256u; i += wgsize.x) {
-        ue4m3_fp32_lut[i] = ue4m3_to_fp32_build(i);
-    }
-#endif
     barrier();
 }
 #endif
@@ -2020,12 +1996,59 @@ floate4m3_t ue4m3_from_bits(uint8_t x) {
 }
 #endif
 
+float ue4m3_to_fp32_uint(uint u) {
+    const uint exp = (u >> 3) & 15u;
+    const uint man = u & 7u;
+    const float norm = uintBitsToFloat(((exp + 120u) << 23) | (man << 20));
+    const float subn = float(man) * (1.0f / 512.0f);
+    const float val  = (exp == 0u) ? subn : norm;
+    return (u == 0u || u == 127u) ? 0.0f : val;
+}
+
 float ue4m3_to_fp32(uint8_t x) {
 #if defined(USE_OCP_FP4)
     return float(ue4m3_from_bits(x));
 #else
-    return ue4m3_fp32_lut[uint(x)];
+    return ue4m3_to_fp32_uint(uint(x));
 #endif
+}
+
+float ue4m3_half_to_fp32_uint(uint u) {
+    const uint exp = (u >> 3) & 15u;
+    const uint man = u & 7u;
+    const float norm = uintBitsToFloat(((exp + 119u) << 23) | (man << 20));
+    const float subn = float(man) * (1.0f / 1024.0f);
+    const float val  = (exp == 0u) ? subn : norm;
+    return (u == 0u || u == 127u) ? 0.0f : val;
+}
+
+vec4 fe2m1x4_doubled(const uint packed_nibbles) {
+    const uint n0 =  packed_nibbles        & 0xFu;
+    const uint n1 = (packed_nibbles >>  8) & 0xFu;
+    const uint n2 = (packed_nibbles >> 16) & 0xFu;
+    const uint n3 =  packed_nibbles >> 24;
+    const float m0 = float((0xC8643210u >> ((n0 & 7u) << 2)) & 0xFu);
+    const float m1 = float((0xC8643210u >> ((n1 & 7u) << 2)) & 0xFu);
+    const float m2 = float((0xC8643210u >> ((n2 & 7u) << 2)) & 0xFu);
+    const float m3 = float((0xC8643210u >> ((n3 & 7u) << 2)) & 0xFu);
+    return vec4(
+        (n0 >= 8u) ? -m0 : m0,
+        (n1 >= 8u) ? -m1 : m1,
+        (n2 >= 8u) ? -m2 : m2,
+        (n3 >= 8u) ? -m3 : m3
+    );
+}
+
+vec4 fe2m1x4_to_fp32(const uint packed_nibbles) {
+    const uvec4 idx  = uvec4(unpack8(packed_nibbles));
+    const uvec4 a    = idx & 7u;
+    const uvec4 s    = (idx & 8u) << 28;
+    const uvec4 e    = a >> 1;
+    const uvec4 m    = a & 1u;
+    const uvec4 norm = ((e + 126u) << 23) | (m << 22);
+    const uvec4 bits = mix(norm, uvec4(126u << 23), equal(a, uvec4(1u)));
+    const uvec4 res  = mix(s | bits, uvec4(0u), equal(a, uvec4(0u)));
+    return uintBitsToFloat(res);
 }
 #endif
 

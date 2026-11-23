@@ -269,7 +269,7 @@ void main() {
     float L = 0;
 
     float slope_v = 1.0;
-    if (p.max_bias > 0.0f) {
+    if (!USE_BANDED && p.max_bias > 0.0f) {
         slope_v = float(perElemOpComputeSlope(0, 0, ACC_TYPE(0), iq2));
     }
 
@@ -349,6 +349,20 @@ void main() {
             }
         }
 
+        if (USE_BANDED && myrow < N) {
+            const uint32_t kv_base = j * Bc + lc * FL_CPL;
+            const int32_t min_rel_dist = int32_t(myrow) + int32_t(KV) - int32_t(p.ne2) - int32_t(kv_base + FL_CPL - 1u);
+            const int32_t max_rel_dist = int32_t(myrow) + int32_t(KV) - int32_t(p.ne2) - int32_t(kv_base);
+            if (max_rel_dist >= 0 && min_rel_dist < int32_t(floatBitsToUint(p.max_bias))) {
+                [[unroll]] for (uint32_t k = 0; k < FL_CPL; ++k) {
+                    const uint32_t kv_col = kv_base + k;
+                    if (!KV_bounds_check || kv_col < KV) {
+                        s[k] += get_banded_rel_bias(myrow, iq2, kv_col);
+                    }
+                }
+            }
+        }
+
         float mx = s[0];
         [[unroll]] for (uint32_t k = 1; k < FL_CPL; ++k) {
             mx = max(mx, s[k]);
@@ -411,7 +425,7 @@ void main() {
         }
     } else {
         if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0) {
-            const float sink = float(perElemOpGetSink(0, 0u, ACC_TYPE(0), iq2));
+            const float sink = float(perElemOpGetSink(sg * 16 + lr, 0u, ACC_TYPE(0), iq2));
             float ms = 1.0f;
             float vs = 1.0f;
             if (sink > M) {

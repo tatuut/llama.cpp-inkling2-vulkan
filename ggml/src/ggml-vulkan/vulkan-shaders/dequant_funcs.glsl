@@ -529,17 +529,21 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
 #endif
 }
 vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
-#ifdef USE_OCP_FP4
     const uint sub = iqs >> 4;
     const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
     const uint j = iqs & 7;
     const uint shift = (iqs & 8) >> 1; // 0 or 4
     const uint vui = data_a_packed32[a_offset + ib].qs[(sub * 8u + j) / 4u];
+#ifdef USE_OCP_FP4
     return vec4(bitcastExtractfe2m1EXT(unpack8(vui), shift)) * d;
 #else
-    const vec2 v0 = dequantize(ib, iqs, a_offset);
-    const vec2 v1 = dequantize(ib, iqs + 2u, a_offset);
-    return vec4(v0.x, v0.y, v1.x, v1.y);
+    const u8vec4 idx = unpack8((vui >> shift) & 0x0F0F0F0Fu);
+    return vec4(
+        float(kvalues_mxfp4[idx.x]),
+        float(kvalues_mxfp4[idx.y]),
+        float(kvalues_mxfp4[idx.z]),
+        float(kvalues_mxfp4[idx.w])
+    ) * (d * 0.5f);
 #endif
 }
 #endif

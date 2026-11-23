@@ -30,6 +30,7 @@ const bool Q_IN_REGS       = (Flags & 32) != 0;
 // coopmat1: subgroups own Q rows, O in coopmat accumulators. K/V staged in LDS, or loaded from global memory with FLIP_DIRECT.
 const bool FLIP            = (Flags & 64) != 0;
 const bool FLIP_DIRECT     = (Flags & 128) != 0;
+const bool USE_BANDED      = (Flags & 256) != 0;
 
 // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
 const uint32_t HSK_pad = (HSK + 15) & ~15;
@@ -78,7 +79,10 @@ layout (push_constant) uniform parameter {
     uint32_t k_num;
 } p;
 
-#define SINK_ENABLE_BIT (1<<24)
+#define SINK_ENABLE_BIT    (1<<24)
+#define SINK_PER_QUERY_BIT (1<<25)
+#define SINK_BATCH_BIT     (1<<26)
+#define REL_TYPE_SHIFT     27
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};
@@ -89,6 +93,8 @@ layout (binding = 5) writeonly buffer OV4 {D_TYPEV4 data_ov4[];};
 layout (binding = 6) readonly buffer MO {uint32_t data_mask_opt[];};
 
 layout (binding = 7) readonly buffer SP {int32_t data_sparse[];};
+layout (binding = 7) readonly buffer REL {float data_rel[];};
+layout (binding = 7) readonly buffer REL_U32 {uint32_t data_rel_u32[];};
 
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, e.g. when computing Mold-M.
 #define NEG_FLT_MAX_OVER_2 uintBitsToFloat(0xFEFFFFFF)
@@ -147,17 +153,48 @@ ACC_TYPE perElemOpComputeSlope(const in uint32_t r, const in uint32_t c, const i
     return ACC_TYPE(pow(base, ACC_TYPE(exph)));
 }
 
-// Load the sink value, indexed by Q's dimension 2.
-ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
-{
-    const uint32_t h = iq2 + (r % p.gqa_ratio);
-
-    return ACC_TYPE(data_s[h]);
-}
-
 uint32_t i, N, KV, split_k_index, Tr, start_j, end_j,
          gqa_iq1, iq2, iq3, rk2, rk3, rv2, rv3, ik2, ik3, iv2, iv3,
          q_stride, k_stride, v_stride, m_stride, sparse_base;
+
+// Load the sink value, indexed by Q's dimension 2 (plus optional per-query and batch dims for banded FA).
+ACC_TYPE perElemOpGetSink(const in uint32_t r, const in uint32_t c, const in ACC_TYPE elem, const in uint32_t iq2)
+{
+    const uint32_t h = iq2 + (r % p.gqa_ratio);
+    uint32_t idx = h;
+    if ((p.mask_n_head_log2 & SINK_PER_QUERY_BIT) != 0) {
+        const uint32_t q_idx = (p.gqa_ratio > 1) ? gqa_iq1 : min(i * Br + r, p.ne2 - 1u);
+        idx += q_idx * p.neq2;
+    }
+    if ((p.mask_n_head_log2 & SINK_BATCH_BIT) != 0) {
+        idx += iq3 * p.ne2 * p.neq2;
+    }
+    return ACC_TYPE(data_s[idx]);
+}
+
+// Banded relative-position bias stored in binding 7; metadata is bit-packed into unused push-constant slots.
+float get_banded_rel_bias(const in uint32_t q_idx, const in uint32_t h, const in uint32_t kv_col)
+{
+    const uint32_t rel_extent = floatBitsToUint(p.max_bias);
+    const int32_t  rel_dist   = int32_t(q_idx) + int32_t(KV) - int32_t(p.ne2) - int32_t(kv_col);
+    if (q_idx < p.ne2 && h < p.neq2 && rel_dist >= 0 && uint32_t(rel_dist) < rel_extent) {
+        const uint32_t rel_nb1  = floatBitsToUint(p.logit_softcap);
+        const uint32_t rel_nb2  = floatBitsToUint(p.m0);
+        const uint32_t rel_nb3  = floatBitsToUint(p.m1);
+        const uint32_t elem_idx = uint32_t(rel_dist) + h * rel_nb1 + q_idx * rel_nb2 + iq3 * rel_nb3;
+        const uint32_t rel_type = (p.mask_n_head_log2 >> REL_TYPE_SHIFT) & 3u;
+        if (rel_type == 0u) {
+            return data_rel[elem_idx];
+        }
+        const uint32_t word = data_rel_u32[elem_idx >> 1];
+        if (rel_type == 1u) {
+            return unpackHalf2x16(word)[elem_idx & 1u];
+        }
+        const uint32_t bits16 = (word >> ((elem_idx & 1u) * 16u)) & 0xFFFFu;
+        return uintBitsToFloat(bits16 << 16);
+    }
+    return 0.0f;
+}
 
 void init_indices()
 {

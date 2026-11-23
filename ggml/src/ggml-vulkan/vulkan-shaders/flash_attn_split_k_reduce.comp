@@ -78,7 +78,14 @@ void main() {
 
     float sink;
     if (p.sinks != 0) {
-        sink = data_s[n];
+        uint s_idx = n;
+        if ((p.sinks & 2u) != 0) {
+            s_idx += i2 * p.ne1;
+        }
+        if ((p.sinks & 4u) != 0) {
+            s_idx += i3 * p.ne2 * p.ne1;
+        }
+        sink = data_s[s_idx];
 
         float ms = 1.0f;
         float vs = 1.0f;

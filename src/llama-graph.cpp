@@ -1957,6 +1957,20 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
                  bool   cached) const {
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+
+    // Pre-compute expert scale rows before ggml_mul_mat_id so GGML_OP_MUL stays immediately adjacent for backend fusion.
+    ggml_tensor * s = nullptr;
+    if (w_s) {
+        const int64_t n_expert = w_s->ne[0];
+        const int64_t n_tokens = cur->ne[2];
+        s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
+        if (n_tokens > 1) {
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        }
+        s = ggml_get_rows(ctx0, s, ids);
+        ggml_build_forward_expand(gf, s);
+    }
+
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
@@ -1968,12 +1982,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_prec_set_acc(res, GGML_PREC_BF16);
     }
 
-    if (w_s) {
-        const int64_t n_expert = w_s->ne[0];
-        const int64_t n_tokens = cur->ne[2];
-        ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
+    if (s) {
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {
@@ -2664,11 +2673,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cb(gate_up, "ffn_moe_gate_up_biased", il);
             }
 
-            const int64_t n_ff = gate_up->ne[0] / 2;
-            cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
-            cb(cur, "ffn_moe_gate", il);
-            up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
-            cb(up, "ffn_moe_up", il);
+            if (type_op == LLM_FFN_SITU) {
+                cur = gate_up;
+                up  = nullptr;
+            } else {
+                const int64_t n_ff = gate_up->ne[0] / 2;
+                cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+                cb(cur, "ffn_moe_gate", il);
+                up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+                cb(up, "ffn_moe_up", il);
+            }
         } else {
             // separate gate and up path
             up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
@@ -2739,13 +2753,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     GGML_ASSERT(has_gate);
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
-
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                    if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
-                    }
-                    cur = ggml_mul(ctx0, act, up);
+                    cur = ggml_swiglu_oai(ctx0, cur, up, -beta, lb);
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:

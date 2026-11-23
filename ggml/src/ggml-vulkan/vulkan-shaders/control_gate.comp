@@ -1,0 +1,38 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Cur         { float data_cur[];         };
+layout(binding = 0) readonly  buffer CurV4       { vec4  data_cur_v4[];      };
+layout(binding = 1) readonly  buffer Msg         { float data_msg[];         };
+layout(binding = 1) readonly  buffer MsgV4       { vec4  data_msg_v4[];      };
+layout(binding = 2) readonly  buffer GainRaw     { float data_gain_raw[];    };
+layout(binding = 2) readonly  buffer GainRawV4   { vec4  data_gain_raw_v4[]; };
+layout(binding = 3) readonly  buffer ForgetRaw   { float data_forget_raw[];  };
+layout(binding = 3) readonly  buffer ForgetRawV4 { vec4  data_forget_raw_v4[];};
+layout(binding = 4) writeonly buffer Dst         { float data_dst[];         };
+layout(binding = 4) writeonly buffer DstV4       { vec4  data_dst_v4[];      };
+
+layout(push_constant) uniform parameter {
+    uint ne;
+} p;
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    if ((p.ne & 3u) == 0u) {
+        const uint ne4 = p.ne >> 2;
+        if (tid >= ne4) {
+            return;
+        }
+        const vec4 forget = tanh(data_forget_raw_v4[tid]);
+        const vec4 gain   = tanh(data_gain_raw_v4[tid]);
+        data_dst_v4[tid]  = (vec4(1.0f) - forget) * data_cur_v4[tid] + gain * data_msg_v4[tid];
+    } else {
+        if (tid >= p.ne) {
+            return;
+        }
+        const float forget = tanh(data_forget_raw[tid]);
+        const float gain   = tanh(data_gain_raw[tid]);
+        data_dst[tid]      = (1.0f - forget) * data_cur[tid] + gain * data_msg[tid];
+    }
+}

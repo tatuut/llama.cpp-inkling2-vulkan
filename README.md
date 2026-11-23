@@ -1,3 +1,6 @@
+> **Inkling 2 Mini Vulkan Fork (`AMD Radeon 780M` / Vulkan `FLASH_ATTN_EXT_BANDED` + Fused Kernels)**
+> See **[README_INKLING2_VULKAN.md](./README_INKLING2_VULKAN.md)** for full benchmarks, kernel details, build instructions, and test verification results.
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)

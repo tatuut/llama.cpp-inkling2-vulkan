@@ -544,6 +544,11 @@ static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_bias{ GGML
                                                                             GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
                                                                             GGML_OP_DIV,      GGML_OP_RESHAPE };
 
+static constexpr std::initializer_list<ggml_op> topk_moe_sigmoid_norm_eps_bias{ GGML_OP_UNARY,    GGML_OP_RESHAPE,  GGML_OP_ADD,
+                                                                                GGML_OP_ARGSORT,  GGML_OP_VIEW,     GGML_OP_GET_ROWS,
+                                                                                GGML_OP_RESHAPE,  GGML_OP_SUM_ROWS, GGML_OP_SCALE,
+                                                                                GGML_OP_DIV,      GGML_OP_RESHAPE };
+
 static constexpr std::initializer_list<ggml_op> topk_moe_sqrt_softplus_norm_bias{ GGML_OP_UNARY,    GGML_OP_SQRT,
                                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
                                                                                   GGML_OP_ARGSORT,  GGML_OP_VIEW,
@@ -593,6 +598,115 @@ static constexpr std::initializer_list<std::array<int, 3>> hc_post_gate_edges {
     { 1, 0, 0 }, // sigmoid->src[0] == scale
     { 2, 0, 1 }, // scale->src[0]   == sigmoid
     { 3, 2, 2 }, // hc_post->src[2] == scale (post)
+};
+
+// (1 - tanh(forget_raw))*cur + tanh(gain_raw)*msg
+static constexpr std::initializer_list<ggml_op> control_gate_pattern {
+    GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> control_gate_edges {
+    { 1, 0, 0 },
+    { 2, 0, 1 },
+    { 4, 0, 3 },
+    { 5, 0, 2 },
+    { 5, 1, 4 },
+};
+
+static constexpr std::initializer_list<ggml_op> loop_norm_down_pattern {
+    GGML_OP_CONCAT, GGML_OP_RMS_NORM, GGML_OP_RESHAPE, GGML_OP_MUL_MAT
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> loop_norm_down_edges {
+    { 1, 0, 0 },
+    { 2, 0, 1 },
+    { 3, 1, 2 },
+};
+
+static constexpr std::initializer_list<ggml_op> loop_up_gate_pattern {
+    GGML_OP_MUL_MAT, GGML_OP_MUL_MAT,
+    GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> loop_up_gate_edges {
+    { 2, 0, 1 },
+    { 3, 0, 2 },
+    { 4, 0, 3 },
+    { 5, 0, 0 },
+    { 6, 0, 5 },
+    { 7, 0, 4 },
+    { 7, 1, 6 },
+};
+
+static constexpr std::initializer_list<ggml_op> ssm_conv_resid_scale_pattern {
+    GGML_OP_SSM_CONV, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_SCALE
+};
+
+static constexpr std::initializer_list<ggml_op> ssm_conv_dyn_resid_scale_pattern {
+    GGML_OP_SSM_CONV, GGML_OP_RESHAPE,
+    // lag 0 (includes dyn reshape at [6])
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    // lag 1
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    // lag 2
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    // lag 3
+    GGML_OP_VIEW, GGML_OP_TRANSPOSE, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_ADD,
+    // residual + scale
+    GGML_OP_ADD, GGML_OP_SCALE
+};
+
+static constexpr std::initializer_list<ggml_op> inkling_rel_bias_pattern {
+    GGML_OP_PAD, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_SUB, GGML_OP_PERMUTE,
+    GGML_OP_CONT, GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_CONT
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> inkling_rel_bias_edges {
+    { 1, 0, 0 },
+    { 3, 0, 1 },
+    { 3, 1, 2 },
+    { 4, 0, 3 },
+    { 5, 0, 4 },
+    { 6, 0, 5 },
+    { 7, 0, 6 },
+    { 8, 0, 7 },
+    { 9, 0, 8 },
+};
+
+static constexpr std::initializer_list<ggml_op> depth_mix_pattern_1 {
+    GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT
+};
+
+static constexpr std::initializer_list<ggml_op> depth_mix_pattern_n {
+    GGML_OP_CONT, GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> depth_mix_edges {
+    { 2, 1, 1 },
+    { 3, 0, 2 },
+    { 4, 0, 0 },
+    { 4, 1, 3 },
+};
+
+static constexpr std::initializer_list<ggml_op> depth_mix_stack_pattern_1 {
+    GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE, GGML_OP_CONT,
+    GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT
+};
+
+static constexpr std::initializer_list<ggml_op> depth_mix_stack_pattern_n {
+    GGML_OP_RMS_NORM, GGML_OP_CONCAT, GGML_OP_TRANSPOSE, GGML_OP_CONT,
+    GGML_OP_REPEAT, GGML_OP_MUL_MAT, GGML_OP_SOFT_MAX, GGML_OP_MUL_MAT
+};
+
+static constexpr std::initializer_list<std::array<int, 3>> depth_mix_stack_edges {
+    { 1, 1, 0 },
+    { 2, 0, 1 },
+    { 3, 0, 2 },
+    { 5, 0, 1 },
+    { 5, 1, 4 },
+    { 6, 0, 5 },
+    { 7, 0, 3 },
+    { 7, 1, 6 },
 };
 
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softmax_norm_edges {
@@ -1023,6 +1137,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_resid_scale_f32;
+    vk_pipeline pipeline_ssm_conv_dyn_f32;
+    vk_pipeline pipeline_control_gate_f32;
+    vk_pipeline pipeline_loop_norm_down_f32;
+    vk_pipeline pipeline_loop_up_gate_f32;
+    vk_pipeline pipeline_inkling_rel_bias_f32;
+    vk_pipeline pipeline_depth_mix_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1361,12 +1482,20 @@ struct ggml_backend_vk_context {
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.
-    int fused_ops_write_mask {};
+    uint64_t fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    bool fused_control_gate {};
+    bool fused_loop_norm_down {};
+    bool fused_loop_up_gate {};
+    bool fused_ssm_conv_resid_scale {};
+    bool fused_ssm_conv_dyn {};
+    bool fused_inkling_rel_bias {};
+    bool fused_depth_mix {};
+    bool fused_depth_mix_stack {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

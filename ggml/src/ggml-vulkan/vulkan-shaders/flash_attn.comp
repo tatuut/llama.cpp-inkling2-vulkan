@@ -165,8 +165,8 @@ void main() {
         slope[r] = ACC_TYPE(1.0);
     }
 
-    // ALiBi
-    if (p.max_bias > 0.0f) {
+    // ALiBi (disabled when USE_BANDED repurposes p.max_bias)
+    if (!USE_BANDED && p.max_bias > 0.0f) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             slope[r] = perElemOpComputeSlope(tile_row(r), col_tid, ACC_TYPE(0), iq2);
         }
@@ -458,6 +458,26 @@ void main() {
                     FLOAT_TYPE mvf = masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];
 
                     Sf[r][c] += slope[r]*mvf;
+                }
+            }
+        }
+
+        if (USE_BANDED) {
+            const uint32_t q_min = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br);
+            const uint32_t q_max = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br + Br - 1u);
+            const int32_t min_rel_dist = int32_t(q_min) + int32_t(KV) - int32_t(p.ne2) - int32_t(j * Bc + Bc - 1u);
+            const int32_t max_rel_dist = int32_t(q_max) + int32_t(KV) - int32_t(p.ne2) - int32_t(j * Bc);
+            if (max_rel_dist >= 0 && min_rel_dist < int32_t(floatBitsToUint(p.max_bias))) {
+                [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                    const uint32_t kv_col = j * Bc + c * cols_per_iter + col_tid;
+                    if (!KV_bounds_check || kv_col < KV) {
+                        [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                            const uint32_t row   = tile_row(r);
+                            const uint32_t q_idx = (p.gqa_ratio > 1) ? gqa_iq1 : (i * Br + row);
+                            const uint32_t h     = iq2 + ((p.gqa_ratio > 1) ? row : 0u);
+                            Sf[r][c] += ACC_TYPE(get_banded_rel_bias(q_idx, h, kv_col));
+                        }
+                    }
                 }
             }
         }

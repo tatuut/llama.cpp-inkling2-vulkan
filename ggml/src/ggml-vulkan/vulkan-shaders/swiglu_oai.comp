@@ -3,6 +3,14 @@
 #include "glu_head.glsl"
 
 float op(float a, float b) {
+    if (p.alpha < 0.0f) {
+        const float beta = -p.alpha;
+        const float lb   = p.limit;
+        const float gate = beta * tanh(a / beta) / (1.0f + exp(-a));
+        const float up   = (lb > 0.0f) ? (lb * tanh(b / lb)) : b;
+        return gate * up;
+    }
+
     float xi = min(a, p.limit);
     float gi = max(min(b, p.limit), -p.limit);
 

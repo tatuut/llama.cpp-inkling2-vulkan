@@ -1,0 +1,53 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Src0    { float src0[]; };
+layout(binding = 1) readonly  buffer Src1    { float src1[]; };
+layout(binding = 2) readonly  buffer Dynamic { float dyn[];  };
+layout(binding = 3) readonly  buffer Cur     { float cur[];  };
+layout(binding = 4) writeonly buffer Dst     { float dst[];  };
+
+layout(push_constant) uniform PushConstants {
+    uint nb01;
+    uint nb02;
+    uint nb11;
+    uint nr;
+    uint n_t;
+    uint n_s;
+    uint n_heads;
+    uint head_dim;
+    float scale;
+} p;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    const uint t = gl_WorkGroupID.y;
+    const uint s = gl_WorkGroupID.z;
+
+    if (c >= p.nr || t >= p.n_t || s >= p.n_s) {
+        return;
+    }
+
+    const uint src0_base  = s * (p.nb02 >> 2) + t + c * (p.nb01 >> 2);
+    const uint src1_base  = c * (p.nb11 >> 2);
+    const uint global_tok = s * p.n_t + t;
+    const uint h          = c / p.head_dim;
+    const uint dyn_base   = (global_tok * p.n_heads + h) * 4u;
+
+    const vec4 xv = vec4(
+        src0[src0_base + 0u],
+        src0[src0_base + 1u],
+        src0[src0_base + 2u],
+        src0[src0_base + 3u]
+    );
+    const vec4 wv = vec4(
+        src1[src1_base + 0u] + dyn[dyn_base + 3u],
+        src1[src1_base + 1u] + dyn[dyn_base + 2u],
+        src1[src1_base + 2u] + dyn[dyn_base + 1u],
+        src1[src1_base + 3u] + dyn[dyn_base + 0u]
+    );
+
+    const uint dst_idx = global_tok * p.nr + c;
+    dst[dst_idx] = (cur[dst_idx] + dot(xv, wv)) * p.scale;
+}

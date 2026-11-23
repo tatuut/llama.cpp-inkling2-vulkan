@@ -3471,10 +3471,19 @@ static void ggml_compute_forward_swiglu_oai_f32(
         }
 
         for (int k = 0; k < nc; k++) {
-            const float x = std::min(src0_p[k], limit);
-            const float y = std::clamp(src1_p[k], -limit, limit);
-            const float out_glu = x / (1.f + expf(alpha * (-x)));
-            dst_p[k] = out_glu * (y + 1.f);
+            if (alpha < 0.0f) {
+                const float beta   = -alpha;
+                const float x      = src0_p[k];
+                const float y      = src1_p[k];
+                const float gate   = beta * tanhf(x / beta) / (1.0f + expf(-x));
+                const float up_act = (limit > 0.0f) ? (limit * tanhf(y / limit)) : y;
+                dst_p[k] = gate * up_act;
+            } else {
+                const float x = std::min(src0_p[k], limit);
+                const float y = std::clamp(src1_p[k], -limit, limit);
+                const float out_glu = x / (1.f + expf(alpha * (-x)));
+                dst_p[k] = out_glu * (y + 1.f);
+            }
         }
 
 #ifndef NDEBUG
@@ -3539,10 +3548,19 @@ static void ggml_compute_forward_swiglu_oai_half(
         }
 
         for (int k = 0; k < nc; k++) {
-            const float x = std::min(type_conversion_table<T>::to_f32(src0_p[k]), limit);
-            const float y = std::clamp(type_conversion_table<T>::to_f32(src1_p[k]), -limit, limit);
-            const float out_glu = x / (1.f + expf(alpha * (-x)));
-            dst_p[k] = type_conversion_table<T>::from_f32(out_glu * (y + 1.f));
+            if (alpha < 0.0f) {
+                const float beta   = -alpha;
+                const float x      = type_conversion_table<T>::to_f32(src0_p[k]);
+                const float y      = type_conversion_table<T>::to_f32(src1_p[k]);
+                const float gate   = beta * tanhf(x / beta) / (1.0f + expf(-x));
+                const float up_act = (limit > 0.0f) ? (limit * tanhf(y / limit)) : y;
+                dst_p[k] = type_conversion_table<T>::from_f32(gate * up_act);
+            } else {
+                const float x = std::min(type_conversion_table<T>::to_f32(src0_p[k]), limit);
+                const float y = std::clamp(type_conversion_table<T>::to_f32(src1_p[k]), -limit, limit);
+                const float out_glu = x / (1.f + expf(alpha * (-x)));
+                dst_p[k] = type_conversion_table<T>::from_f32(out_glu * (y + 1.f));
+            }
         }
 
 #ifndef NDEBUG
@@ -4567,8 +4585,6 @@ static void ggml_compute_forward_l2_norm_f32(
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
 
-    GGML_ASSERT(eps >= 0.0f);
-
     // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -4581,7 +4597,9 @@ static void ggml_compute_forward_l2_norm_f32(
                     sum += (ggml_float)(xi * xi);
                 }
 
-                const float scale = 1.0f/fmaxf(sqrtf(sum), eps);
+                const float scale = (eps < 0.0f)
+                    ? fminf(1.0f, fmaxf(0.0f, (-eps) / (sqrtf(sum) + 1e-6f)))
+                    : (1.0f / fmaxf(sqrtf(sum), eps));
 
                 char * y = (char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3;
 
