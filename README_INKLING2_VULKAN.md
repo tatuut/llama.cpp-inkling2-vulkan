@@ -80,3 +80,15 @@ cmake --build build --target llama-server llama-bench llama-completion test-back
   -m Inkling-2-Mini-UD-Q4_K_M.gguf \
   -ngl 99 -fa on -kvu -ctk q8_0 -ctv q8_0 -c 81920 --host 127.0.0.1 --port 8080
 ```
+
+---
+
+## Troubleshooting
+
+- **`unknown model architecture: 'inkling2_loop'`**:
+  This fork is based on Unsloth `b12588-mix-c0c3de8`, which expects GGUFs with `general.architecture = "inkling2"` (`src/llama-arch.cpp`). Upstream `ggml-org/llama.cpp` (`b12600+` / PR #32694) uses `"inkling2_loop"`, so please use Unsloth-format (`inkling2`) GGUF files with this branch.
+- **`SIGILL` (Illegal Instruction) on ARM64 / big.LITTLE / cross-compiled builds**:
+  Even with `-DGGML_VULKAN=ON`, `libggml-cpu` is built and initialized, and `llama.cpp` defaults to `-DGGML_NATIVE=ON` (`-march=native`). Reconfigure with `-DGGML_NATIVE=OFF` (and optionally `-DGGML_LTO=OFF`) to avoid baking unsupported host CPU instructions into the binary:
+  ```bash
+  cmake -B build -G Ninja -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DCMAKE_BUILD_TYPE=Release
+  ```
